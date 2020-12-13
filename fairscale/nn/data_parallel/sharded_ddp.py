@@ -26,10 +26,7 @@ from fairscale.optim.utils import Workhandle
 
 def consume(job_queue: Queue) -> None:
     while True:
-        print("getting a new work item")
         work_item = job_queue.get()
-
-        print("consuming")
         work_item.handle.wait()
         if work_item.callback is not None:
             work_item.callback()
