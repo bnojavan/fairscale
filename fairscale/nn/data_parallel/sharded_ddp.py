@@ -241,10 +241,13 @@ class ShardedDataParallel(nn.Module):
                 if bucket.full():
                     bucket.buffer /= self.world_size
 
-                    self._work_queue.put.append(
+                    self._work_queue.put(
                         Workhandle(
                             handle=dist.reduce(
-                                tensor=bucket.buffer, dst=dst_rank, group=self.process_group, async_op=True,
+                                tensor=bucket.buffer,
+                                dst=dst_rank,
+                                group=self.process_group,
+                                async_op=True,
                             ),
                             callback=bucket.unroll,
                         )
