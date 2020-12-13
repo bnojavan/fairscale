@@ -12,7 +12,11 @@ import torch.distributed as dist
 
 
 class Workhandle:
-    def __init__(self, handle: Any, callback: Optional[Callable]) -> None:
+    """
+    Minimal structure to link a torch.dist work handle, and an optional callback
+    """
+
+    def __init__(self, handle: "dist.Work", callback: Optional[Callable]) -> None:
         self.handle = handle
         self.callback = callback
 

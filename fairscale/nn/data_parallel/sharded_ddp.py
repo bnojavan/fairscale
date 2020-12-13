@@ -15,12 +15,24 @@ from typing import Any, Callable, Generator, List, Tuple, Union
 
 import torch
 from torch import nn
-from torch.autograd import Variable
 import torch.distributed as dist
 from torch.nn import Parameter
 
 from fairscale.optim import OSS
 from fairscale.optim.utils import Workhandle
+import threading
+from queue import Queue
+
+
+def consume(job_queue: Queue) -> None:
+    while True:
+        print("getting a new work item")
+        work_item = job_queue.get()
+
+        print("consuming")
+        work_item.handle.wait()
+        if work_item.callback is not None:
+            work_item.callback()
 
 
 class ShardedDataParallel(nn.Module):
@@ -102,6 +114,13 @@ class ShardedDataParallel(nn.Module):
         if sync_models_at_startup:
             self._sync_params_and_buffers()
 
+        # Start the worker thread which should consume the reduce futures
+        # NOTE: Ideally this could be a seperate process, but torch.distributed.Work items are
+        # not trivially pickable
+        self._work_queue: Queue[Workhandle] = Queue()
+        self._worker = threading.Thread(target=consume, args=(self._work_queue,), daemon=True)
+        self._worker.start()
+
     def forward(self, *inputs: Any, **kwargs: Any) -> Any:
         """
         Module forward pass, handles any DDP-specific work in the background. Primes the
@@ -119,9 +138,9 @@ class ShardedDataParallel(nn.Module):
         return self.module(*inputs, **kwargs)
 
     def reduce(self) -> None:
-        """ .. deprecated:: 0.0.4
+        """.. deprecated:: 0.0.4
 
-            This does not need to be called, the gradient reduction is done automatically during the BW pass
+        This does not need to be called, the gradient reduction is done automatically during the BW pass
         """
         logging.warning("This is not useful anymore, gradients have been reduced automatically with the backward pass")
 
@@ -177,11 +196,6 @@ class ShardedDataParallel(nn.Module):
         Either way a delayed action is necessary and is passed as a callback.
         """
 
-        def gatekeeper() -> None:
-            # Make sure that all the asynchronous calls have concluded before moving on. Consume the futures
-            # and execute the delayed actions (release gradients, unroll the buckets)
-            Variable._execution_engine.queue_callback(optimizer._consume_work_handles)
-
         def reduce_direct(*_: Any) -> None:
             # Skip gradient reduction, do not alter status flags
             if not self.should_accumulate_grads and self._grad_to_be_reduced[index]:
@@ -197,7 +211,7 @@ class ShardedDataParallel(nn.Module):
                         param.grad = None
 
                 # Async reduce for this buffer, log the future
-                optimizer.work_handles.append(
+                self._work_queue.put(
                     Workhandle(
                         handle=dist.reduce(
                             tensor=param.grad.data, dst=dst_rank, group=self.process_group, async_op=True
@@ -205,10 +219,6 @@ class ShardedDataParallel(nn.Module):
                         callback=cleanup,
                     )
                 )
-
-                # If all the reduce operations have been called, add the gatekeeper
-                if len(optimizer.work_handles) == optimizer._max_work_handles:
-                    gatekeeper()
 
         # Bucket, update status, and possibly unroll the results
         def reduce_bucket(*_: Any) -> None:
@@ -231,18 +241,17 @@ class ShardedDataParallel(nn.Module):
                 if bucket.full():
                     bucket.buffer /= self.world_size
 
-                    optimizer.work_handles.append(
+                    self._work_queue.put.append(
                         Workhandle(
                             handle=dist.reduce(
-                                tensor=bucket.buffer, dst=dst_rank, group=self.process_group, async_op=True,
+                                tensor=bucket.buffer,
+                                dst=dst_rank,
+                                group=self.process_group,
+                                async_op=True,
                             ),
                             callback=bucket.unroll,
                         )
                     )
-
-                    # If all the reduce operations have been called, add the gatekeeper
-                    if len(optimizer.work_handles) == optimizer._max_work_handles:
-                        gatekeeper()
 
         return reduce_bucket if should_bucket else reduce_direct
 
