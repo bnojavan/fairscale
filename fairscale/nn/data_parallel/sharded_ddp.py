@@ -11,6 +11,8 @@ reduction automatically.
 import contextlib
 from itertools import chain
 import logging
+from queue import Queue
+import threading
 from typing import Any, Callable, Generator, List, Tuple, Union
 
 import torch
@@ -20,8 +22,6 @@ from torch.nn import Parameter
 
 from fairscale.optim import OSS
 from fairscale.optim.utils import Workhandle
-import threading
-from queue import Queue
 
 
 def consume(job_queue: Queue) -> None:
@@ -244,10 +244,7 @@ class ShardedDataParallel(nn.Module):
                     self._work_queue.put.append(
                         Workhandle(
                             handle=dist.reduce(
-                                tensor=bucket.buffer,
-                                dst=dst_rank,
-                                group=self.process_group,
-                                async_op=True,
+                                tensor=bucket.buffer, dst=dst_rank, group=self.process_group, async_op=True,
                             ),
                             callback=bucket.unroll,
                         )

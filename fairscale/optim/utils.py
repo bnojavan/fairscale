@@ -16,8 +16,8 @@ class Workhandle:
     Minimal structure to link a torch.dist work handle, and an optional callback
     """
 
-    def __init__(self, handle: "dist.Work", callback: Optional[Callable]) -> None:
-        self.handle = handle
+    def __init__(self, handle: Any, callback: Optional[Callable]) -> None:
+        self.handle = handle  # toch.distributed.Work
         self.callback = callback
 
 
