@@ -24,7 +24,7 @@ from fairscale.optim import OSS
 from fairscale.optim.utils import Workhandle
 
 
-def consume(job_queue: Queue) -> None:
+def _consume_work_handles(job_queue: Queue) -> None:
     while True:
         work_item = job_queue.get()
         work_item.handle.wait()
@@ -115,7 +115,7 @@ class ShardedDataParallel(nn.Module):
         # NOTE: Ideally this could be a seperate process, but torch.distributed.Work items are
         # not trivially pickable
         self._work_queue: Queue[Workhandle] = Queue()
-        self._worker = threading.Thread(target=consume, args=(self._work_queue,), daemon=True)
+        self._worker = threading.Thread(target=_consume_work_handles, args=(self._work_queue,), daemon=True)
         self._worker.start()
 
     def forward(self, *inputs: Any, **kwargs: Any) -> Any:
