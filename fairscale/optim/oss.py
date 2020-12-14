@@ -5,7 +5,6 @@
 
 from collections import OrderedDict
 import copy
-from enum import Enum, auto
 import itertools
 from itertools import chain
 import logging
@@ -13,6 +12,7 @@ from math import inf
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
+import torch.autograd.profiler as profiler
 import torch.distributed as dist
 from torch.nn import Parameter
 from torch.optim import SGD, Optimizer
@@ -25,11 +25,6 @@ if TYPE_CHECKING:  # pragma: no cover
     from torch.optim.optimizer import _params_t
 else:
     _params_t = Any
-
-
-class BucketFlush(Enum):
-    Reduce = auto()
-    Broadcast = auto()
 
 
 class OSS(Optimizer):
@@ -74,6 +69,7 @@ class OSS(Optimizer):
         broadcast_buffer_size: int = 2 ** 17,
         **default: Any,
     ):
+
         # Hold all the model params in the root .param_groups
         self.in_super_constructor = True
         super().__init__(params, default)
@@ -103,6 +99,12 @@ class OSS(Optimizer):
 
         # Current default device is set by the parameters allocated to this rank
         self._device = list(self.per_device_params.keys())[0]
+
+        # Handle bucketing for the broadcast step, if multi node mostly
+        if self.world_size > 8:
+            broadcast_buffer_size = 0
+            logging.info("Assuming single node task, deactivating bucketing")
+
         self.buckets: Dict[torch.device, List[Bucket]] = {}
         self.bucket_size = broadcast_buffer_size
         for device, per_device in self.per_device_params.items():
@@ -195,16 +197,18 @@ class OSS(Optimizer):
         self._sync_param_groups()
 
         # Run the optimizer step on this shard only:
-        if closure is not None:
-            loss = self.optim.step(closure=closure, **kwargs)  # type: ignore
-        else:
-            loss = self.optim.step(**kwargs)
+        with profiler.record_function("optim_step"):
+            if closure is not None:
+                loss = self.optim.step(closure=closure, **kwargs)  # type: ignore
+            else:
+                loss = self.optim.step(**kwargs)
 
         # Depending on the DDP engine used, gradients specific to other ranks may still be loaded
         self._free_other_grads()
 
         # Sync all the updated shards in between the ranks
-        self._broadcast_params()
+        with profiler.record_function("optim_broadcast"):
+            self._broadcast_params()
 
         # Sync hypothethical new results from the wrapped optimizer to the exposed param_groups
         self._sync_param_groups(local_to_global=True)
@@ -545,7 +549,6 @@ class OSS(Optimizer):
                             )
 
             self._consume_work_handles()
-            self._handle_trailing_buckets(BucketFlush.Broadcast)
 
     def _consume_work_handles(self) -> None:
         """ Consume all the futures which are tied to this optimizer's buckets.
@@ -558,30 +561,6 @@ class OSS(Optimizer):
                 work_handle.callback()
 
         self.work_handles.clear()
-
-    def _handle_trailing_buckets(self, flush_type: BucketFlush) -> None:
-        """
-        Go through the buckets, flush them if not already empty
-        .. warning: Could be that a bucket flush was already requested, needs to be handled carefully
-        """
-
-        for bucket_list in self.buckets.values():
-            for bucket in bucket_list:
-                if bucket.current_offset > 0:
-                    self.work_handles.append(
-                        Workhandle(
-                            handle=dist.broadcast(
-                                tensor=bucket.buffer, src=bucket.global_ref_rank, group=self.group, async_op=True,
-                            )
-                            if flush_type == BucketFlush.Broadcast
-                            else dist.reduce(
-                                tensor=bucket.buffer, dst=bucket.global_ref_rank, group=self.group, async_op=True,
-                            ),
-                            callback=bucket.unroll,
-                        )
-                    )
-
-        self._consume_work_handles()
 
     def _setup_bucket_strategy(self) -> None:
         """  Tag parameters to either bucket them or broadcast/reduce them directly. The parameters are ordered

@@ -17,11 +17,26 @@ from typing import Any, Callable, Generator, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+import torch.autograd.profiler as profiler
 import torch.distributed as dist
 from torch.nn import Parameter
 
 from fairscale.optim import OSS
 from fairscale.optim.utils import Workhandle
+
+_NCCL_FUTURES_ENABLED = False
+
+
+def _futures_available() -> bool:
+    # Futures from communication primitives are only available when using NCCL and post pytorch 1.7
+    torch_version_major = int(torch.__version__.split(".")[0])
+    torch_version_minor = int(torch.__version__.split(".")[1])
+
+    return (
+        ((torch_version_major == 1 and torch_version_minor >= 7) or (torch_version_major > 1))
+        and dist.get_backend() == dist.Backend.NCCL
+        and _NCCL_FUTURES_ENABLED
+    )
 
 
 def _consume_work_handles(job_queue: Queue) -> None:
@@ -111,11 +126,13 @@ class ShardedDataParallel(nn.Module):
         if sync_models_at_startup:
             self._sync_params_and_buffers()
 
-        # Handle asynchronous work to be done along the backward pass. Two options
+        # Handle asynchronous work to be done along the backward pass.
+        # Two options: either futures are available out of communication primitives,
+        # or we store the torch.distributed.Work items and process them in a seperated thread
         self._work_queue: Optional[Queue[Workhandle]] = None
         self._worker: Optional[threading.Thread] = None
 
-        if self.device_type != torch.device("cuda").type:
+        if self.device_type != torch.device("cuda").type or not _futures_available():
             # Start the worker thread which should consume the reduce futures
             # NOTE: Ideally this could be a seperate process, but torch.distributed.Work items are
             # not trivially pickable
@@ -124,23 +141,25 @@ class ShardedDataParallel(nn.Module):
             self._worker = threading.Thread(target=_consume_work_handles, args=(self._work_queue,), daemon=True)
             self._worker.start()
         else:
-            logging.info("ShardedDDP: Using CUDA based reduce async work handling")
+            logging.info("ShardedDDP: Using NCCL based reduce async work handling")
 
     def forward(self, *inputs: Any, **kwargs: Any) -> Any:
         """
         Module forward pass, handles any DDP-specific work in the background. Primes the
         backward pass for gradient reduction to the proper ranks.
         """
-        if self.enable_broadcast_buffers:
-            # NCCL communications are on a different stream, needs to be blocking
-            # for the subsequent FW to be correct
-            self.sync_buffers(blocking=True)
 
-        # Reset all the grad reduce and bucket state flags
-        self._grad_to_be_reduced = [True] * len(self._grad_to_be_reduced)
+        with profiler.record_function("forward_pass"):
+            if self.enable_broadcast_buffers:
+                # NCCL communications are on a different stream, needs to be blocking
+                # for the subsequent FW to be correct
+                self.sync_buffers(blocking=True)
 
-        # Normal FW on the base model
-        return self.module(*inputs, **kwargs)
+            # Reset all the grad reduce and bucket state flags
+            self._grad_to_be_reduced = [True] * len(self._grad_to_be_reduced)
+
+            # Normal FW on the base model
+            return self.module(*inputs, **kwargs)
 
     def reduce(self) -> None:
         """.. deprecated:: 0.0.4
