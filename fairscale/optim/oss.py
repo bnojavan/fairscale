@@ -544,7 +544,8 @@ class OSS(Optimizer):
                                 )
                             )
 
-        self._consume_work_handles()
+            self._consume_work_handles()
+            self._handle_trailing_buckets(BucketFlush.Broadcast)
 
     def _consume_work_handles(self) -> None:
         """ Consume all the futures which are tied to this optimizer's buckets.

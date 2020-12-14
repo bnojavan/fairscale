@@ -13,7 +13,7 @@ from itertools import chain
 import logging
 from queue import Queue
 import threading
-from typing import Any, Callable, Generator, List, Tuple, Union
+from typing import Any, Callable, Generator, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -111,12 +111,20 @@ class ShardedDataParallel(nn.Module):
         if sync_models_at_startup:
             self._sync_params_and_buffers()
 
-        # Start the worker thread which should consume the reduce futures
-        # NOTE: Ideally this could be a seperate process, but torch.distributed.Work items are
-        # not trivially pickable
-        self._work_queue: Queue[Workhandle] = Queue()
-        self._worker = threading.Thread(target=_consume_work_handles, args=(self._work_queue,), daemon=True)
-        self._worker.start()
+        # Handle asynchronous work to be done along the backward pass. Two options
+        self._work_queue: Optional[Queue[Workhandle]] = None
+        self._worker: Optional[threading.Thread] = None
+
+        if self.device_type != torch.device("cuda").type:
+            # Start the worker thread which should consume the reduce futures
+            # NOTE: Ideally this could be a seperate process, but torch.distributed.Work items are
+            # not trivially pickable
+            logging.info("ShardedDDP: Using thread-based reduce async work handling")
+            self._work_queue = Queue()
+            self._worker = threading.Thread(target=_consume_work_handles, args=(self._work_queue,), daemon=True)
+            self._worker.start()
+        else:
+            logging.info("ShardedDDP: Using CUDA based reduce async work handling")
 
     def forward(self, *inputs: Any, **kwargs: Any) -> Any:
         """
@@ -183,9 +191,7 @@ class ShardedDataParallel(nn.Module):
         assert False, "This parameter is not present in an optimizer, this should not happen"
         return (None, -1)
 
-    def _get_reduce_fn(
-        self, index: int, param: torch.Tensor, should_bucket: bool, dst_rank: int, optimizer: OSS
-    ) -> Callable:
+    def _get_reduce_fn(self, index: int, param: torch.Tensor, dst_rank: int) -> Callable:
         """
         Two possible backward hooks for a given parameter: either directly reduce to the appropriate rank,
         or contribute to a bucket and reduce when the bucket is full.
@@ -193,7 +199,7 @@ class ShardedDataParallel(nn.Module):
         Either way a delayed action is necessary and is passed as a callback.
         """
 
-        def reduce_direct(*_: Any) -> None:
+        def reduce(*_: Any) -> None:
             # Skip gradient reduction, do not alter status flags
             if not self.should_accumulate_grads and self._grad_to_be_reduced[index]:
                 assert param.grad is not None, "Reducing gradients during backward pass, cannot be None"
@@ -202,52 +208,32 @@ class ShardedDataParallel(nn.Module):
                 self._grad_to_be_reduced[index] = False
                 param.grad /= self.world_size
 
-                # Future work includes clearing up the buffer if possible
-                def cleanup() -> None:
-                    if dst_rank != self.global_rank:
-                        param.grad = None
-
                 # Async reduce for this buffer, log the future
-                self._work_queue.put(
-                    Workhandle(
-                        handle=dist.reduce(
-                            tensor=param.grad.data, dst=dst_rank, group=self.process_group, async_op=True
-                        ),
-                        callback=cleanup,
-                    )
-                )
-
-        # Bucket, update status, and possibly unroll the results
-        def reduce_bucket(*_: Any) -> None:
-            # Skip gradient reduction, do not alter status flags
-            if not self.should_accumulate_grads and self._grad_to_be_reduced[index]:
-                assert param.grad is not None, "Reducing gradients during backward pass, cannot be None"
-
-                # Make sure that this is not fired twice
-                self._grad_to_be_reduced[index] = False
-
-                # Copy to the flat buffer, update the buffer state
-                bucket = optimizer.buckets[param.device][dst_rank]
-
-                assert bucket.append(param, use_gradient=True), "Bucket overflow: max %s - current %s - adding %s" % (
-                    bucket.max_size,
-                    bucket.current_offset,
-                    param.grad.numel(),
-                )
-
-                if bucket.full():
-                    bucket.buffer /= self.world_size
+                if self._worker is not None and self._work_queue is not None:
+                    # Future work includes clearing up the buffer if possible
+                    def cleanup() -> None:
+                        if dst_rank != self.global_rank:
+                            param.grad = None
 
                     self._work_queue.put(
                         Workhandle(
                             handle=dist.reduce(
-                                tensor=bucket.buffer, dst=dst_rank, group=self.process_group, async_op=True,
+                                tensor=param.grad.data, dst=dst_rank, group=self.process_group, async_op=True
                             ),
-                            callback=bucket.unroll,
+                            callback=cleanup,
                         )
                     )
+                else:
+                    # Use CUDA futures
+                    def cleanup_fut(fut: Any) -> None:
+                        fut.wait()
+                        if dst_rank != self.global_rank:
+                            param.grad = None
 
-        return reduce_bucket if should_bucket else reduce_direct
+                    handle = dist.reduce(tensor=param.grad.data, dst=dst_rank, group=self.process_group, async_op=True)
+                    handle.get_future().then(cleanup_fut)
+
+        return reduce
 
     def _setup_backward_hooks(self) -> None:
         """
@@ -269,5 +255,5 @@ class ShardedDataParallel(nn.Module):
                 dst_rank = sharded_optimizer.param_to_rank[param]
                 index = len(self._grad_accs)
 
-                grad_acc.register_hook(self._get_reduce_fn(index, param, should_bucket, dst_rank, sharded_optimizer))
+                grad_acc.register_hook(self._get_reduce_fn(index, param, dst_rank))
                 self._grad_accs.append(grad_acc)  # keep this function in scope
