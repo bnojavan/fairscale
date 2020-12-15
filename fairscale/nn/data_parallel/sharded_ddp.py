@@ -242,7 +242,9 @@ class ShardedDataParallel(nn.Module):
                 # Make sure that the end of the backward pass is blocking
                 self._reduced_grads[optimizer] += 1
                 if self._reduced_grads[optimizer] == self._reduced_grads_max[optimizer]:
-                    torch.futures.wait_all(self._futures)
+                    if len(self._futures) > 0:
+                        torch.futures.wait_all(self._futures)
+                        self._futures.clear()
 
         return reduce
 
