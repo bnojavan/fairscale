@@ -24,7 +24,7 @@ from torch.nn import Parameter
 from fairscale.optim import OSS
 from fairscale.optim.utils import Workhandle
 
-_NCCL_FUTURES_ENABLED = False
+_NCCL_FUTURES_ENABLED = True
 
 
 def _futures_available() -> bool:
@@ -120,6 +120,8 @@ class ShardedDataParallel(nn.Module):
         # we build an iterator which goes through all the parameters involved globally
         self._param_iterator = chain(*[optim.should_bucket_param.keys() for optim in self.sharded_optimizers])
         self._grad_accs: List[Callable] = []
+        self._reduced_grads = {o: 0 for o in self.sharded_optimizers}
+        self._reduced_grads_max = {o: len(o.param_to_rank.values()) for o in self.sharded_optimizers}
         self._setup_backward_hooks()
 
         # Make sure that all ranks start with the same model
@@ -150,6 +152,8 @@ class ShardedDataParallel(nn.Module):
         """
 
         with profiler.record_function("forward_pass"):
+            self._reduced_grads = {o: 0 for o in self.sharded_optimizers}
+
             if self.enable_broadcast_buffers:
                 # NCCL communications are on a different stream, needs to be blocking
                 # for the subsequent FW to be correct
@@ -164,18 +168,6 @@ class ShardedDataParallel(nn.Module):
         This does not need to be called, the gradient reduction is done automatically during the BW pass
         """
         logging.warning("This is not useful anymore, gradients have been reduced automatically with the backward pass")
-
-    def _sync_params_and_buffers(self) -> None:
-        """
-        Sync the complete model states in between the ranks
-        """
-        with torch.no_grad():
-            work_handles = [
-                dist.broadcast(t, src=self.reference_global_rank, group=self.process_group, async_op=True)
-                for t in self.module.state_dict().values()
-            ]
-
-            _ = list(map(lambda x: x.wait(), work_handles))
 
     def sync_buffers(self, blocking: bool = False) -> None:
         """
@@ -207,7 +199,7 @@ class ShardedDataParallel(nn.Module):
         assert False, "This parameter is not present in an optimizer, this should not happen"
         return (None, -1)
 
-    def _get_reduce_fn(self, param: torch.Tensor, dst_rank: int) -> Callable:
+    def _get_reduce_fn(self, param: torch.Tensor, dst_rank: int, optimizer: OSS) -> Callable:
         """
         Two possible backward hooks for a given parameter: either directly reduce to the appropriate rank,
         or contribute to a bucket and reduce when the bucket is full.
@@ -242,6 +234,12 @@ class ShardedDataParallel(nn.Module):
 
                     handle.get_future().then(cleanup_fut)
 
+                # Make sure that the end of the backward pass is blocking
+                self._reduced_grads[optimizer] += 1
+                if self._reduced_grads[optimizer] == self._reduced_grads_max[optimizer]:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+
         return reduce
 
     def _setup_backward_hooks(self) -> None:
@@ -263,5 +261,17 @@ class ShardedDataParallel(nn.Module):
                 grad_acc = p_tmp.grad_fn.next_functions[0][0]
                 dst_rank = sharded_optimizer.param_to_rank[param]
 
-                grad_acc.register_hook(self._get_reduce_fn(param, dst_rank))
+                grad_acc.register_hook(self._get_reduce_fn(param, dst_rank, sharded_optimizer))
                 self._grad_accs.append(grad_acc)  # keep this function in scope
+
+    def _sync_params_and_buffers(self) -> None:
+        """
+        Sync the complete model states in between the ranks
+        """
+        with torch.no_grad():
+            work_handles = [
+                dist.broadcast(t, src=self.reference_global_rank, group=self.process_group, async_op=True)
+                for t in self.module.state_dict().values()
+            ]
+
+            _ = list(map(lambda x: x.wait(), work_handles))
