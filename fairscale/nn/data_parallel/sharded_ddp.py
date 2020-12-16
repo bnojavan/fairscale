@@ -12,7 +12,7 @@ import contextlib
 from itertools import chain
 import logging
 from queue import Queue
-import threading
+from threading import Thread
 from typing import Any, Callable, Generator, List, Optional, Tuple, Union
 
 import torch
@@ -45,6 +45,7 @@ def consume_work_handles(job_queue: Queue) -> None:
         work_item.handle.wait()
         if work_item.callback is not None:
             work_item.callback()
+        job_queue.task_done()
 
 
 class ShardedDataParallel(nn.Module):
@@ -132,8 +133,8 @@ class ShardedDataParallel(nn.Module):
         # Handle asynchronous work to be done along the backward pass.
         # Two options: either futures are available out of communication primitives,
         # or we store the torch.distributed.Work items and process them in a seperated thread
+        self._worker: Optional[Thread] = None
         self._work_queue: Optional[Queue[Workhandle]] = None
-        self._worker: Optional[threading.Thread] = None
 
         if self.device_type != torch.device("cuda").type or not _futures_available():
             # Start the worker thread which should consume the reduce futures
@@ -141,7 +142,7 @@ class ShardedDataParallel(nn.Module):
             # not trivially pickable
             logging.info("ShardedDDP: Using thread-based reduce async work handling")
             self._work_queue = Queue()
-            self._worker = threading.Thread(target=consume_work_handles, args=(self._work_queue,), daemon=True)
+            self._worker = Thread(target=consume_work_handles, args=(self._work_queue,), daemon=True)
             self._worker.start()
         else:
             logging.info("ShardedDDP: Using NCCL based reduce async work handling")
@@ -245,6 +246,13 @@ class ShardedDataParallel(nn.Module):
                     if len(self._futures) > 0:
                         torch.futures.wait_all(self._futures)
                         self._futures.clear()
+                    elif self._work_queue is not None:
+                        self._work_queue.join()
+
+                    # If CUDA, wait for all streams on all devices
+                    for device in optimizer.per_device_params.keys():
+                        if device.type == torch.device("cuda").type:
+                            torch.cuda.synchronize(device=device)
 
         return reduce
 

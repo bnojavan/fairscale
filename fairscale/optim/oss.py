@@ -101,7 +101,7 @@ class OSS(Optimizer):
         self._device = list(self.per_device_params.keys())[0]
 
         # Handle bucketing for the broadcast step, if multi node mostly
-        if self.world_size > 8:
+        if self.world_size <= 8:
             broadcast_buffer_size = 0
             logging.info("Assuming single node task, deactivating bucketing")
 
@@ -115,7 +115,6 @@ class OSS(Optimizer):
             ]
         self.should_bucket_param: Dict[torch.Tensor, bool] = {}
         self.work_handles: List[Workhandle] = []
-        self._max_work_handles = -1
         self._setup_bucket_strategy()
 
     # Partition helpers
@@ -589,11 +588,3 @@ class OSS(Optimizer):
                 self.buckets[device][dst_rank].max_offset = offset
                 self.buckets[device][dst_rank].global_ref_rank = self.get_global_rank(self.group, dst_rank)
                 self.buckets[device][dst_rank].global_rank = self.global_rank
-
-        # Determine the max work handles in flight:
-        # - all the direct reduce/broadcast
-        self._max_work_handles = sum(not value for value in self.should_bucket_param.values())
-
-        # - if we're bucketing, this means more work handles: one per rank and per device
-        if self.bucket_size > 0:
-            self._max_work_handles += len(self.per_device_params.keys()) * self.world_size
